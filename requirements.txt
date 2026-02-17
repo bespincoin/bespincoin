@@ -1,0 +1,4 @@
+ecdsa==0.18.0
+base58==2.1.1
+flask==3.0.0
+flask-cors==4.0.0
