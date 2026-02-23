@@ -1,8 +1,16 @@
 #!/bin/bash
-# Bespin (BSP) Mining Script - Client-side PoW
+# Bespin (BSP) Miner - Client-side Proof of Work
+# Usage: ./mine.sh YOUR_WALLET_ADDRESS [API_URL]
+# Example: ./mine.sh 1YourAddressHere https://api.bespincoin.com
 
-MINER_ADDRESS="1DkFiLHsoDqRyhnXyKVeyjcdiuiSkvvKn5"
-API_URL="https://api.bespincoin.com"
+MINER_ADDRESS="${1:-}"
+API_URL="${2:-https://api.bespincoin.com}"
+
+if [ -z "$MINER_ADDRESS" ]; then
+    echo "Usage: ./mine.sh YOUR_WALLET_ADDRESS [API_URL]"
+    echo "Example: ./mine.sh 1YourAddressHere https://api.bespincoin.com"
+    exit 1
+fi
 
 mine_block() {
     # Get work template (instant)
