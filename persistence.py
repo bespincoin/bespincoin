@@ -1,9 +1,10 @@
-"""
+﻿"""
 Blockchain Persistence Layer
 Saves blockchain data to SQLite database
 """
 
 import sqlite3
+import threading
 import json
 from typing import List, Optional
 from blockchain import Block
@@ -15,8 +16,23 @@ class BlockchainDB:
     
     def __init__(self, db_path: str = "blockchain.db"):
         self.db_path = db_path
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
+        self._local = threading.local()
+        conn = self._get_conn()
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         self.create_tables()
+
+    def _get_conn(self):
+        """Get thread-local database connection - each thread gets its own"""
+        if not hasattr(self._local, 'conn') or self._local.conn is None:
+            self._local.conn = sqlite3.connect(self.db_path, timeout=30.0)
+            self._local.conn.execute("PRAGMA journal_mode=WAL")
+            self._local.conn.execute("PRAGMA synchronous=NORMAL")
+        return self._local.conn
+
+    @property
+    def conn(self):
+        return self._get_conn()
     
     def create_tables(self):
         """Create database tables if they don't exist"""
@@ -98,6 +114,12 @@ class BlockchainDB:
         cursor = self.conn.cursor()
         
         try:
+            # Check if transactions already exist for this block - prevents duplicates
+            cursor.execute("SELECT COUNT(*) FROM transactions WHERE block_index = ?", (block.index,))
+            if cursor.fetchone()[0] > 0:
+                print(f"Block {block.index} already has transactions, rejecting duplicate")
+                return False
+
             # Save block
             cursor.execute("""
                 INSERT OR REPLACE INTO blocks 
@@ -130,12 +152,15 @@ class BlockchainDB:
         
         # Save transaction
         cursor.execute("""
-            INSERT OR REPLACE INTO transactions 
+            INSERT OR IGNORE INTO transactions 
             (txid, block_index, version, locktime, timestamp)
             VALUES (?, ?, ?, ?, ?)
         """, (tx.txid, block_index, tx.version, tx.locktime, tx.timestamp))
         
-        # Delete old inputs/outputs if updating
+        # Only write inputs/outputs if transaction was actually inserted
+        if cursor.rowcount == 0:
+            return
+
         cursor.execute("DELETE FROM tx_inputs WHERE txid = ?", (tx.txid,))
         cursor.execute("DELETE FROM tx_outputs WHERE txid = ?", (tx.txid,))
         
@@ -338,10 +363,17 @@ class BlockchainDB:
         return utxo_set
     
     def get_block_count(self) -> int:
-        """Get total number of blocks"""
-        cursor = self.conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM blocks")
-        return cursor.fetchone()[0]
+        """Get next block index (MAX block_index + 1) to handle gaps"""
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT MAX(block_index) FROM blocks")
+            result = cursor.fetchone()
+            if result and result[0] is not None:
+                return result[0] + 1
+            return 0
+        except Exception as e:
+            print(f"Error getting block count: {e}")
+            return 0
     
     def save_metadata(self, key: str, value: str):
         """Save metadata key-value pair"""
@@ -359,6 +391,49 @@ class BlockchainDB:
         row = cursor.fetchone()
         return row[0] if row else None
     
+    def get_latest_block_from_db(self):
+        """Get the latest block directly from database"""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT block_index, timestamp, previous_hash, merkle_root,
+                   nonce, difficulty, hash
+            FROM blocks ORDER BY block_index DESC LIMIT 1
+        """)
+        row = cursor.fetchone()
+        if not row:
+            return None
+        block_index, timestamp, previous_hash, merkle_root, nonce, difficulty, block_hash = row
+        from blockchain import Block
+        transactions = self.load_transactions_for_block(block_index)
+        block = Block(block_index, transactions, previous_hash, difficulty)
+        block.timestamp = timestamp
+        block.merkle_root = merkle_root
+        block.nonce = nonce
+        block.hash = block_hash
+        return block
+
+    def find_payment_tx(self, address: str, min_amount: float, after_timestamp: float) -> tuple:
+        """Find a confirmed transaction output to address >= amount after timestamp.
+        Returns (txid, amount) or (None, None)"""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT o.txid, o.amount 
+            FROM tx_outputs o
+            JOIN transactions t ON o.txid = t.txid
+            WHERE o.script_pubkey = ? 
+              AND o.amount >= ?
+              AND t.timestamp >= ?
+            ORDER BY t.timestamp DESC
+            LIMIT 1
+        """, (address, min_amount, after_timestamp))
+        row = cursor.fetchone()
+        if row:
+            return row[0], row[1]
+        return None, None
+
     def close(self):
         """Close database connection"""
         self.conn.close()
+
+
+

@@ -37,13 +37,13 @@ class UTXOSet:
     
     def get_utxos_for_address(self, address: str) -> List[UTXO]:
         """Get all UTXOs for a specific address"""
-        return [utxo for utxo in self.utxos.values() 
+        return [utxo for utxo in list(self.utxos.values())
                 if utxo.script_pubkey == address]
     
     def get_balance(self, address: str) -> float:
         """Get total balance for an address"""
-        utxos = self.get_utxos_for_address(address)
-        return sum(utxo.amount for utxo in utxos)
+        return sum(utxo.amount for utxo in list(self.utxos.values())
+                   if utxo.script_pubkey == address)
     
     def process_transaction(self, tx: Transaction) -> bool:
         """

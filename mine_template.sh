@@ -1,23 +1,20 @@
 #!/bin/bash
 # Bespin (BSP) Mining Script - Client-side PoW
-
-MINER_ADDRESS="1DkFiLHsoDqRyhnXyKVeyjcdiuiSkvvKn5"
-API_URL="https://api.bespincoin.com"
+# MINER_ADDRESS and API_URL set by caller
 
 mine_block() {
-    # Get work template (instant)
     work=$(curl -s -X POST "$API_URL/mine/work" \
         -H "Content-Type: application/json" \
         -d "{\"miner_address\": \"$MINER_ADDRESS\"}")
 
-    if [ -z "$work" ] || echo "$work" | grep -q "error"; then
+    if [ -z "$work" ] || echo "$work" | grep -q '"error"'; then
         echo "Failed to get work: $work"
+        sleep 2
         return 1
     fi
 
-    # Do PoW in Python (fast, runs locally)
-    result=$(python3 - <<EOF
-import json, hashlib, time
+    result=$(python3 - <<PYEOF
+import json, hashlib, time, sys
 
 work = json.loads('''$work''')
 index = work['block_index']
@@ -26,8 +23,6 @@ difficulty = work['difficulty']
 transactions = work['transactions']
 timestamp = time.time()
 
-# Calculate merkle root
-import hashlib
 def merkle(txids):
     if not txids:
         return '0' * 64
@@ -53,7 +48,7 @@ while True:
     header = f"{index}{timestamp}{prev_hash}{merkle_root}{nonce}"
     hash_val = hashlib.sha256(hashlib.sha256(header.encode()).digest()).hexdigest()
     if hash_val.startswith(target):
-        block = {
+        print(json.dumps({
             'index': index,
             'timestamp': timestamp,
             'previous_hash': prev_hash,
@@ -62,14 +57,12 @@ while True:
             'difficulty': difficulty,
             'hash': hash_val,
             'transactions': transactions
-        }
-        print(json.dumps(block))
+        }))
         break
     nonce += 1
-    if nonce % 100000 == 0:
-        import sys
+    if nonce % 300000 == 0:
         print(f"Tried {nonce} nonces...", file=sys.stderr)
-EOF
+PYEOF
 )
 
     if [ -z "$result" ]; then
@@ -77,25 +70,19 @@ EOF
         return 1
     fi
 
-    # Submit solved block (instant)
     response=$(curl -s -X POST "$API_URL/mine/submit" \
         -H "Content-Type: application/json" \
         -d "{\"block\": $result}")
 
     if echo "$response" | grep -q "Block accepted"; then
-        block_index=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['index'])")
-        echo "✓ Block $block_index mined!"
+        idx=$(echo "$result" | python3 -c "import sys,json; print(json.load(sys.stdin)['index'])")
+        echo "✓ Block $idx accepted"
     else
-        echo "✗ Rejected: $response"
+        echo "✗ $response"
     fi
 }
 
-echo "Bespin Miner - $MINER_ADDRESS"
-echo "API: $API_URL"
-echo "Press Ctrl+C to stop"
-echo ""
-
+echo "Miner: $MINER_ADDRESS @ $API_URL"
 while true; do
     mine_block
-    sleep 1
 done
