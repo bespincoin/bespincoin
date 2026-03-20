@@ -25,10 +25,18 @@ class Blockchain:
         self.currency_name = "Bespin"
         self.currency_symbol = "BSP"
         self._add_block_lock = threading.Lock()
+        # Difficulty retargeting — Bitcoin-style
+        self.target_block_time = 600        # 10 minutes in seconds
+        self.retarget_interval = 2016       # retarget every 2016 blocks (~2 weeks)
+        self.max_difficulty_change = 4      # max 4x adjustment per period
         
         if self.load_from_db():
             self.founder_address = self.db.get_metadata('founder_address')
-            print(f"Loaded existing blockchain with {len(self.chain)} blocks")
+            # Restore current difficulty from the latest block in DB
+            latest = self.db.get_latest_block_from_db()
+            if latest:
+                self.difficulty = latest.difficulty
+            print(f"Loaded existing blockchain with {len(self.chain)} blocks, difficulty={self.difficulty}")
         else:
             self.founder_address = founder_address
             self.create_genesis_block()
@@ -281,7 +289,46 @@ class Blockchain:
             self.chain.append(block)
             self.db.save_block(block)
             self.db.save_utxo_set(self.utxo_set)
+            # Retarget difficulty if we just hit an interval boundary
+            self.difficulty = self.get_next_difficulty()
             return True
+
+    def get_next_difficulty(self) -> int:
+        """Bitcoin-style difficulty retargeting every 2016 blocks.
+        Adjusts so that 2016 blocks take ~2 weeks at 10 min/block.
+        Capped at 4x increase or 0.25x decrease per period."""
+        actual_height = self.db.get_block_count() or len(self.chain)
+
+        # Not yet at first retarget window — keep initial difficulty
+        if actual_height < self.retarget_interval:
+            return self.difficulty
+
+        # Only retarget on interval boundaries
+        if actual_height % self.retarget_interval != 0:
+            return self.difficulty
+
+        # Fetch the block at the start of this retarget window
+        window_start_index = actual_height - self.retarget_interval
+        first_block = self.db.get_block_by_index(window_start_index)
+        last_block = self.db.get_latest_block_from_db() or self.get_latest_block()
+
+        if not first_block or not last_block:
+            return self.difficulty
+
+        actual_time = last_block.timestamp - first_block.timestamp
+        expected_time = self.retarget_interval * self.target_block_time
+
+        # Clamp adjustment to 4x in either direction
+        ratio = actual_time / expected_time
+        ratio = max(1 / self.max_difficulty_change, min(self.max_difficulty_change, ratio))
+
+        # Difficulty is the number of leading zero bits — adjust proportionally
+        new_difficulty = max(1, round(self.difficulty / ratio))
+
+        print(f"Difficulty retarget at block {actual_height}: "
+              f"actual={actual_time:.0f}s expected={expected_time:.0f}s "
+              f"ratio={ratio:.3f} {self.difficulty} -> {new_difficulty}")
+        return new_difficulty
 
     def get_balance(self, address: str) -> float:
         return self.utxo_set.get_balance(address)

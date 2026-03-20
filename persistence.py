@@ -412,6 +412,27 @@ class BlockchainDB:
         block.hash = block_hash
         return block
 
+    def get_block_by_index(self, index: int):
+        """Get a specific block by index — used for difficulty retargeting"""
+        cursor = self.conn.cursor()
+        cursor.execute("""
+            SELECT block_index, timestamp, previous_hash, merkle_root,
+                   nonce, difficulty, hash
+            FROM blocks WHERE block_index = ?
+        """, (index,))
+        row = cursor.fetchone()
+        if not row:
+            return None
+        block_index, timestamp, previous_hash, merkle_root, nonce, difficulty, block_hash = row
+        from blockchain import Block
+        # Skip loading transactions — we only need timestamp and hash for retargeting
+        block = Block(block_index, [], previous_hash, difficulty)
+        block.timestamp = timestamp
+        block.merkle_root = merkle_root
+        block.nonce = nonce
+        block.hash = block_hash
+        return block
+
     def find_payment_tx(self, address: str, min_amount: float, after_timestamp: float) -> tuple:
         """Find a confirmed transaction output to address >= amount after timestamp.
         Returns (txid, amount) or (None, None)"""
