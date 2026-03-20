@@ -119,27 +119,99 @@ class P2PNode:
         
         elif msg_type == Message.GET_BLOCKS:
             start_index = message.get('start_index', 0)
+            limit = min(message.get('limit', 500), 500)  # max 500 blocks per request
             blocks_data = []
-            for block in self.blockchain.chain[start_index:]:
-                blocks_data.append(block.to_dict())
-            return {'type': Message.BLOCKS_RESPONSE, 'blocks': blocks_data}
+            total_height = self.blockchain.db.get_block_count() or 0
+            end_index = min(start_index + limit, total_height)
+            for idx in range(start_index, end_index):
+                try:
+                    txs = self.blockchain.db.load_transactions_for_block(idx)
+                    cursor = self.blockchain.db.conn.cursor()
+                    cursor.execute(
+                        "SELECT block_index, previous_hash, hash, nonce, timestamp, difficulty, merkle_root "
+                        "FROM blocks WHERE block_index=?", (idx,)
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        blocks_data.append({
+                            'index': row[0],
+                            'previous_hash': row[1],
+                            'hash': row[2],
+                            'nonce': row[3],
+                            'timestamp': row[4],
+                            'difficulty': row[5],
+                            'merkle_root': row[6],
+                            'transactions': [tx.to_dict() for tx in txs]
+                        })
+                except Exception as e:
+                    print(f"Error serialising block {idx}: {e}")
+                    break
+            return {'type': Message.BLOCKS_RESPONSE, 'blocks': blocks_data, 'total_height': total_height}
         
         elif msg_type == Message.NEW_BLOCK:
-            # Handle new block from network
             block_data = message.get('block')
-            # TODO: Validate and add block
-            print(f"Received new block from {address}")
-        
+            if not block_data:
+                return None
+            try:
+                from transaction import TxInput, TxOutput
+                transactions = []
+                for tx_data in block_data.get('transactions', []):
+                    inputs = [TxInput(i['txid'], i['vout'], i['script_sig'], i.get('sequence', 4294967295))
+                              for i in tx_data.get('inputs', [])]
+                    outputs = [TxOutput(o['amount'], o['script_pubkey'])
+                               for o in tx_data.get('outputs', [])]
+                    tx = Transaction(inputs, outputs)
+                    tx.txid = tx_data['txid']
+                    tx.timestamp = tx_data.get('timestamp', 0)
+                    transactions.append(tx)
+                block = Block(
+                    block_data['index'],
+                    transactions,
+                    block_data['previous_hash'],
+                    block_data['difficulty']
+                )
+                block.timestamp = block_data['timestamp']
+                block.nonce = block_data['nonce']
+                block.merkle_root = block_data['merkle_root']
+                block.hash = block_data['hash']
+                if self.blockchain.add_block(block):
+                    print(f"Accepted block {block.index} from peer {address}")
+                    # Remove included txs from mempool
+                    included = {tx.txid for tx in transactions if not tx.is_coinbase()}
+                    self.blockchain.pending_transactions = [
+                        t for t in self.blockchain.pending_transactions
+                        if t.txid not in included
+                    ]
+                else:
+                    print(f"Rejected block {block_data.get('index')} from peer {address}")
+            except Exception as e:
+                print(f"Error processing NEW_BLOCK from {address}: {e}")
+
         elif msg_type == Message.NEW_TRANSACTION:
-            # Handle new transaction from network
             tx_data = message.get('transaction')
-            # TODO: Validate and add transaction
-            print(f"Received new transaction from {address}")
+            if not tx_data:
+                return None
+            try:
+                from transaction import TxInput, TxOutput
+                inputs = [TxInput(i['txid'], i['vout'], i['script_sig'], i.get('sequence', 4294967295))
+                          for i in tx_data.get('inputs', [])]
+                outputs = [TxOutput(o['amount'], o['script_pubkey'])
+                           for o in tx_data.get('outputs', [])]
+                tx = Transaction(inputs, outputs)
+                tx.txid = tx_data['txid']
+                tx.timestamp = tx_data.get('timestamp', 0)
+                # Only add if not already in mempool
+                existing_ids = {t.txid for t in self.blockchain.pending_transactions}
+                if tx.txid not in existing_ids:
+                    self.blockchain.pending_transactions.append(tx)
+                    print(f"Added tx {tx.txid[:16]}... from peer {address} to mempool")
+            except Exception as e:
+                print(f"Error processing NEW_TRANSACTION from {address}: {e}")
         
         return None
     
     def _connect_to_seeds(self):
-        """Connect to seed nodes"""
+        """Connect to seed nodes and sync chain"""
         for seed in self.seed_nodes:
             try:
                 host, port = seed.split(':')
@@ -149,6 +221,11 @@ class P2PNode:
                     print(f"Connected to seed node: {peer}")
             except Exception as e:
                 print(f"Failed to connect to seed {seed}: {e}")
+
+        if self.peers:
+            print("Syncing blockchain with peers...")
+            sync_thread = threading.Thread(target=self.sync_blockchain, daemon=True)
+            sync_thread.start()
     
     def _ping_peer(self, peer: Peer) -> bool:
         """Ping a peer to check if it's alive"""
@@ -242,37 +319,114 @@ class P2PNode:
                 print(f"Failed to broadcast to {peer}: {e}")
     
     def sync_blockchain(self):
-        """Sync blockchain with peers"""
+        """Sync blockchain with peers — downloads missing blocks in chunks"""
         if not self.peers:
             print("No peers to sync with")
             return
-        
-        # Find longest chain among peers
-        longest_chain_length = len(self.blockchain.chain)
-        longest_chain_peer = None
-        
-        for peer in self.peers:
+
+        # Find the peer with the longest chain
+        best_peer = None
+        best_height = self.blockchain.db.get_block_count() or 0
+
+        for peer in list(self.peers):
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(5)
                 sock.connect((peer.host, peer.port))
-                
-                message = {'type': Message.GET_BLOCKS, 'start_index': 0}
-                sock.send(json.dumps(message).encode('utf-8'))
-                
-                response = sock.recv(1048576).decode('utf-8')  # 1MB max
-                data = json.loads(response)
-                
-                if data.get('type') == Message.BLOCKS_RESPONSE:
-                    blocks = data.get('blocks', [])
-                    if len(blocks) > longest_chain_length:
-                        longest_chain_length = len(blocks)
-                        longest_chain_peer = peer
-                
+                # Request 1 block just to get total_height
+                msg = {'type': Message.GET_BLOCKS, 'start_index': 0, 'limit': 1}
+                sock.send(json.dumps(msg).encode('utf-8'))
+                response = b''
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    response += chunk
+                    try:
+                        data = json.loads(response.decode('utf-8'))
+                        break
+                    except:
+                        continue
                 sock.close()
-            except:
-                pass
-        
-        if longest_chain_peer:
-            print(f"Syncing with peer {longest_chain_peer}")
-            # TODO: Implement chain replacement logic
+                peer_height = data.get('total_height', 0)
+                if peer_height > best_height:
+                    best_height = peer_height
+                    best_peer = peer
+            except Exception as e:
+                print(f"Could not check height from {peer}: {e}")
+
+        if not best_peer:
+            print("Already up to date or no peers available")
+            return
+
+        print(f"Syncing from {best_peer} — peer height: {best_height}, our height: {self.blockchain.db.get_block_count()}")
+
+        CHUNK = 500
+        from transaction import TxInput, TxOutput
+        current = self.blockchain.db.get_block_count() or 0
+
+        while current < best_height:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(30)
+                sock.connect((best_peer.host, best_peer.port))
+                msg = {'type': Message.GET_BLOCKS, 'start_index': current, 'limit': CHUNK}
+                sock.send(json.dumps(msg).encode('utf-8'))
+
+                # Read full response (may be large)
+                response = b''
+                while True:
+                    chunk = sock.recv(65536)
+                    if not chunk:
+                        break
+                    response += chunk
+                    try:
+                        data = json.loads(response.decode('utf-8'))
+                        break
+                    except:
+                        continue
+                sock.close()
+
+                blocks_data = data.get('blocks', [])
+                if not blocks_data:
+                    break
+
+                for block_data in blocks_data:
+                    try:
+                        transactions = []
+                        for tx_data in block_data.get('transactions', []):
+                            inputs = [TxInput(i['txid'], i['vout'], i['script_sig'], i.get('sequence', 4294967295))
+                                      for i in tx_data.get('inputs', [])]
+                            outputs = [TxOutput(o['amount'], o['script_pubkey'])
+                                       for o in tx_data.get('outputs', [])]
+                            tx = Transaction(inputs, outputs)
+                            tx.txid = tx_data['txid']
+                            tx.timestamp = tx_data.get('timestamp', 0)
+                            transactions.append(tx)
+
+                        block = Block(
+                            block_data['index'],
+                            transactions,
+                            block_data['previous_hash'],
+                            block_data['difficulty']
+                        )
+                        block.timestamp = block_data['timestamp']
+                        block.nonce = block_data['nonce']
+                        block.merkle_root = block_data['merkle_root']
+                        block.hash = block_data['hash']
+
+                        if not self.blockchain.add_block(block):
+                            print(f"Sync stopped — block {block_data['index']} rejected")
+                            return
+                    except Exception as e:
+                        print(f"Error reconstructing block {block_data.get('index')}: {e}")
+                        return
+
+                current = self.blockchain.db.get_block_count() or current
+                print(f"Synced to block {current}/{best_height}")
+
+            except Exception as e:
+                print(f"Sync error at block {current}: {e}")
+                break
+
+        print(f"Sync complete. Height: {self.blockchain.db.get_block_count()}")

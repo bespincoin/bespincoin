@@ -4,6 +4,11 @@ from chain import Blockchain
 from crypto_utils import Wallet
 from network import P2PNode
 import threading
+import sqlite3
+import hashlib
+import uuid
+import os
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins
@@ -83,43 +88,116 @@ def get_latest_block():
 
 
 # Transaction endpoints
+MAX_INPUTS_PER_TX = 150  # safe limit well under 1MB JSON
+
 @app.route('/transaction/new', methods=['POST'])
 def new_transaction():
-    """Create new transaction"""
+    """Create new transaction - auto-batches large UTXO sets in background"""
     data = request.get_json()
-    
+
     required = ['sender_private_key', 'recipient_address', 'amount']
     if not all(k in data for k in required):
         return jsonify({'error': 'Missing required fields'}), 400
-    
+
     try:
-        # Create wallet from private key
+        from transaction import Transaction, TxInput, TxOutput
+        import time as _time
+        import threading
+
         sender_wallet = Wallet.from_private_key(data['sender_private_key'])
-        
-        # Create transaction
-        tx = blockchain.create_transaction(
-            sender_wallet,
-            data['recipient_address'],
-            float(data['amount'])
-        )
-        
-        if not tx:
-            return jsonify({'error': 'Insufficient funds'}), 400
-        
-        # Add to blockchain
-        success, error = blockchain.add_transaction(tx)
-        if not success:
-            return jsonify({'error': error}), 400
-        
-        # Broadcast to network
-        p2p_node.broadcast_transaction(tx)
-        
+        amount = float(data['amount'])
+        recipient_address = data['recipient_address']
+
+        all_utxos = blockchain.utxo_set.get_utxos_for_address(sender_wallet.address)
+        total_balance = sum(u.amount for u in all_utxos)
+
+        if total_balance < amount:
+            return jsonify({'error': f'Insufficient funds. Balance: {total_balance}, requested: {amount}'}), 400
+
+        def build_and_sign_tx(batch_utxos, to_address, send_amount):
+            total_in = sum(u.amount for u in batch_utxos)
+            inputs = [TxInput(txid=u.txid, vout=u.vout, script_sig="") for u in batch_utxos]
+            outputs = [TxOutput(amount=send_amount, script_pubkey=to_address)]
+            change = round(total_in - send_amount, 8)
+            if change > 0.00000001:
+                outputs.append(TxOutput(amount=change, script_pubkey=sender_wallet.address))
+            tx = Transaction(inputs, outputs)
+            for i, tx_input in enumerate(tx.inputs):
+                sig = sender_wallet.sign(tx.get_signing_data(i))
+                tx_input.script_sig = sig.hex() + ":" + sender_wallet.get_public_key_hex()
+            return tx
+
+        def submit_tx(tx):
+            success, error = blockchain.add_transaction(tx)
+            if not success:
+                return False, error
+            p2p_node.broadcast_transaction(tx)
+            return True, None
+
+        # Select only UTXOs needed to cover amount
+        selected = []
+        running = 0.0
+        for u in all_utxos:
+            selected.append(u)
+            running += u.amount
+            if running >= amount:
+                break
+
+        # Single batch — process immediately and return
+        if len(selected) <= MAX_INPUTS_PER_TX:
+            tx = build_and_sign_tx(selected, recipient_address, amount)
+            ok, err = submit_tx(tx)
+            if not ok:
+                return jsonify({'error': err}), 400
+            return jsonify({'message': 'Transaction added to mempool', 'txid': tx.txid}), 201
+
+        # Multiple batches needed — run in background, return immediately
+        # Build first batch tx now to get a txid to return to the user
+        batches = [selected[i:i+MAX_INPUTS_PER_TX] for i in range(0, len(selected), MAX_INPUTS_PER_TX)]
+        first_batch = batches[0]
+        first_tx = build_and_sign_tx(first_batch, sender_wallet.address, round(sum(u.amount for u in first_batch), 8))
+        ok, err = submit_tx(first_tx)
+        if not ok:
+            return jsonify({'error': f'Transaction failed: {err}'}), 400
+
+        # Process remaining batches + final send in background
+        def process_remaining(remaining_batches, final_amount, final_recipient, wallet):
+            try:
+                for i, batch in enumerate(remaining_batches[:-1]):
+                    _time.sleep(0.5)
+                    batch_total = round(sum(u.amount for u in batch), 8)
+                    tx = build_and_sign_tx(batch, wallet.address, batch_total)
+                    submit_tx(tx)
+
+                # Final send — re-fetch UTXOs to get consolidated ones
+                _time.sleep(1.0)
+                fresh_utxos = blockchain.utxo_set.get_utxos_for_address(wallet.address)
+                fresh_selected = []
+                fresh_running = 0.0
+                for u in fresh_utxos:
+                    fresh_selected.append(u)
+                    fresh_running += u.amount
+                    if fresh_running >= final_amount:
+                        break
+                if fresh_running >= final_amount:
+                    final_tx = build_and_sign_tx(fresh_selected[:MAX_INPUTS_PER_TX], final_recipient, final_amount)
+                    submit_tx(final_tx)
+                    print(f"Background batch complete. Final txid: {final_tx.txid}")
+            except Exception as e:
+                print(f"Background batch error: {e}")
+                import traceback; traceback.print_exc()
+
+        t = threading.Thread(target=process_remaining, args=(batches[1:], amount, recipient_address, sender_wallet), daemon=True)
+        t.start()
+
         return jsonify({
-            'message': 'Transaction added to mempool',
-            'txid': tx.txid
+            'message': 'Transaction processing — funds will arrive shortly',
+            'txid': first_tx.txid,
+            'note': 'Large balance requires batch processing, completing in background'
         }), 201
-    
+
     except Exception as e:
+        import traceback; traceback.print_exc()
         return jsonify({'error': str(e)}), 400
 
 
@@ -307,34 +385,66 @@ def get_address_info(address):
     balance = blockchain.get_balance(address)
     utxos = blockchain.utxo_set.get_utxos_for_address(address)
     
-    # Get recent transactions from recent blocks
+    # Get recent transactions from database
     transactions = []
-    for block in reversed(blockchain.chain[-100:]):  # Last 100 blocks
-        for tx in block.transactions:
-            # Check if address is in outputs
-            for i, output in enumerate(tx.outputs):
-                if output.script_pubkey == address:
-                    transactions.append({
-                        'txid': tx.txid,
-                        'block': block.index,
-                        'timestamp': tx.timestamp,
-                        'type': 'received',
-                        'amount': output.amount,
-                        'vout': i
-                    })
+    try:
+        conn = blockchain.db.conn
+        cursor = conn.cursor()
+        
+        # Query transactions where address received coins
+        cursor.execute("""
+            SELECT b.block_index, t.txid, t.timestamp, o.amount, o.vout
+            FROM transactions t
+            JOIN blocks b ON t.block_index = b.block_index
+            JOIN tx_outputs o ON t.txid = o.txid
+            WHERE o.script_pubkey = ?
+            ORDER BY b.block_index DESC
+            LIMIT 50
+        """, (address,))
+        
+        rows = cursor.fetchall()
+        print(f"Found {len(rows)} transactions for {address}")
+        
+        for row in rows:
+            txid = row[1]
             
-            # Check if address spent inputs (non-coinbase only)
-            if not tx.is_coinbase():
-                for tx_input in tx.inputs:
-                    utxo = blockchain.utxo_set.get_utxo(tx_input.txid, tx_input.vout)
-                    # Check historical - this won't work for spent UTXOs
-                    # For now, skip spent tracking in recent blocks
+            # Get sender address (from first input)
+            from_address = None
+            cursor.execute("""
+                SELECT prev_out.script_pubkey
+                FROM tx_inputs i
+                JOIN tx_outputs prev_out ON i.prev_txid = prev_out.txid AND i.vout = prev_out.vout
+                WHERE i.txid = ?
+                LIMIT 1
+            """, (txid,))
+            sender_row = cursor.fetchone()
+            if sender_row:
+                from_address = sender_row[0]
+            
+            transactions.append({
+                'txid': row[1],
+                'block': row[0],
+                'timestamp': row[2],
+                'type': 'received',
+                'amount': row[3],
+                'vout': row[4],
+                'from': from_address or 'Coinbase'
+            })
+    except Exception as e:
+        print(f"Error fetching transactions for {address}: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        try:
+            cursor.close()
+        except:
+            pass
     
     return jsonify({
         'address': address,
         'balance': balance,
         'utxo_count': len(utxos),
-        'transactions': transactions[:50]  # Limit to 50 most recent
+        'transactions': transactions
     }), 200
 
 
@@ -385,6 +495,21 @@ def get_info():
     }), 200
 
 
+@app.route('/price', methods=['GET'])
+def get_price():
+    """Get current BSP price in USD from CoinGecko, fallback to $0.01"""
+    import requests as req
+    try:
+        r = req.get(
+            'https://api.coingecko.com/api/v3/simple/price?ids=bespincoin&vs_currencies=usd',
+            timeout=5
+        )
+        usd = r.json()['bespincoin']['usd']
+    except Exception:
+        usd = 0.01  # fallback until CoinGecko has data
+    return jsonify({'usd': usd, 'symbol': 'BSP'}), 200
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Health check endpoint"""
@@ -404,23 +529,19 @@ def get_miner_stats():
         CREATE INDEX IF NOT EXISTS idx_output_txid ON tx_outputs(txid, vout)
     """)
     
-    # Optimized query - get first transaction of each block (coinbase)
+    # Get coinbase outputs: rowid=1 per block (coinbase is always inserted first)
     cursor.execute("""
         SELECT 
             o.script_pubkey as address,
             COUNT(*) as blocks_mined,
             SUM(o.amount) as total_rewards
         FROM tx_outputs o
+        INNER JOIN (
+            SELECT MIN(rowid) as min_rowid
+            FROM transactions
+            GROUP BY block_index
+        ) cb ON o.txid = (SELECT txid FROM transactions WHERE rowid = cb.min_rowid)
         WHERE o.vout = 0
-        AND o.txid IN (
-            SELECT t.txid
-            FROM transactions t
-            WHERE t.txid = (
-                SELECT MIN(txid) 
-                FROM transactions 
-                WHERE block_index = t.block_index
-            )
-        )
         GROUP BY o.script_pubkey
         ORDER BY blocks_mined DESC
         LIMIT 100
@@ -592,6 +713,275 @@ def payment_page(payment_id):
 </html>"""
     return html
 
+
+# ── Merchant API Endpoints ───────────────────────────────────────────────────
+
+MERCHANT_DB = "/root/merchant.db"
+
+def get_merchant_db():
+    conn = sqlite3.connect(MERCHANT_DB)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_merchant_db():
+    with get_merchant_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS merchants (
+                id TEXT PRIMARY KEY,
+                email TEXT UNIQUE NOT NULL,
+                api_key TEXT UNIQUE NOT NULL,
+                bsp_address TEXT NOT NULL,
+                webhook_url TEXT,
+                created_at REAL DEFAULT (strftime('%s','now'))
+            )
+        """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS merchant_payments (
+                id TEXT PRIMARY KEY,
+                merchant_id TEXT NOT NULL,
+                amount REAL NOT NULL,
+                description TEXT,
+                status TEXT DEFAULT 'pending',
+                bsp_address TEXT NOT NULL,
+                txid TEXT,
+                created_at REAL DEFAULT (strftime('%s','now')),
+                expires_at REAL,
+                confirmed_at REAL,
+                FOREIGN KEY (merchant_id) REFERENCES merchants(id)
+            )
+        """)
+
+init_merchant_db()
+
+def generate_merchant_api_key():
+    return hashlib.sha256(str(uuid.uuid4()).encode()).hexdigest()
+
+@app.route('/merchant/register', methods=['POST'])
+def register_merchant():
+    data = request.get_json()
+    required = ['email', 'bsp_address']
+    if not all(k in data for k in required):
+        return jsonify({'error': 'Missing required fields: email, bsp_address'}), 400
+    
+    merchant_id = str(uuid.uuid4())
+    api_key = generate_merchant_api_key()
+    
+    try:
+        with get_merchant_db() as db:
+            db.execute(
+                "INSERT INTO merchants (id, email, api_key, bsp_address, webhook_url) VALUES (?,?,?,?,?)",
+                (merchant_id, data['email'], api_key, data['bsp_address'], data.get('webhook_url'))
+            )
+        return jsonify({
+            'merchant_id': merchant_id,
+            'api_key': api_key,
+            'message': 'Merchant registered successfully'
+        }), 201
+    except Exception as e:
+        return jsonify({'error': 'Email already registered'}), 400
+
+@app.route('/merchant/info', methods=['GET'])
+def get_merchant_info():
+    api_key = request.headers.get('X-API-Key')
+    if not api_key:
+        return jsonify({'error': 'Missing API key'}), 401
+    
+    with get_merchant_db() as db:
+        merchant = db.execute("SELECT * FROM merchants WHERE api_key=?", (api_key,)).fetchone()
+    
+    if not merchant:
+        return jsonify({'error': 'Invalid API key'}), 401
+    
+    return jsonify({
+        'merchant_id': merchant['id'],
+        'email': merchant['email'],
+        'bsp_address': merchant['bsp_address'],
+        'webhook_url': merchant['webhook_url'],
+        'created_at': merchant['created_at']
+    }), 200
+
+@app.route('/merchant/payments', methods=['GET'])
+def list_merchant_payments():
+    api_key = request.headers.get('X-API-Key')
+    if not api_key:
+        return jsonify({'error': 'Missing API key'}), 401
+    
+    with get_merchant_db() as db:
+        merchant = db.execute("SELECT * FROM merchants WHERE api_key=?", (api_key,)).fetchone()
+        if not merchant:
+            return jsonify({'error': 'Invalid API key'}), 401
+        
+        limit = request.args.get('limit', 50, type=int)
+        payments_list = db.execute(
+            "SELECT * FROM merchant_payments WHERE merchant_id=? ORDER BY created_at DESC LIMIT ?",
+            (merchant['id'], limit)
+        ).fetchall()
+    
+    return jsonify({'payments': [dict(p) for p in payments_list]}), 200
+
+
+# Bridge endpoints
+import sqlite3 as _sqlite3
+
+BRIDGE_DB = '/root/bridge_requests.db'
+
+def _init_bridge_db():
+    conn = _sqlite3.connect(BRIDGE_DB)
+    conn.execute('''CREATE TABLE IF NOT EXISTS bridge_requests
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  polygon_address TEXT, bsp_amount REAL,
+                  bsp_from_address TEXT, email TEXT,
+                  timestamp TEXT, status TEXT DEFAULT 'pending',
+                  bsp_txid TEXT, polygon_txid TEXT)''')
+    conn.commit()
+    conn.close()
+
+_init_bridge_db()
+
+@app.route('/bridge/request', methods=['POST', 'OPTIONS'])
+def bridge_request():
+    if request.method == 'OPTIONS':
+        r = app.make_default_options_response()
+        r.headers['Access-Control-Allow-Origin'] = '*'
+        r.headers['Access-Control-Allow-Headers'] = 'Content-Type'
+        return r
+    data = request.get_json()
+    poly = data.get('polygon_address', '').strip()
+    amount = data.get('bsp_amount')
+    bsp_from = data.get('bsp_from_address', '').strip()
+    if not poly or not amount:
+        return jsonify({'error': 'Missing required fields'}), 400
+    if float(amount) < 1:
+        return jsonify({'error': 'Minimum bridge amount is 1 BSP'}), 400
+    if float(amount) > 500:
+        return jsonify({'error': 'Maximum bridge amount is 500 BSP per request'}), 400
+    # Check daily limit per BSP address (500 BSP per wallet per day)
+    if bsp_from:
+        from datetime import datetime as _dt
+        today = _dt.utcnow().strftime('%Y-%m-%d')
+        conn_check = _sqlite3.connect(BRIDGE_DB)
+        row = conn_check.execute(
+            "SELECT COALESCE(SUM(bsp_amount),0) FROM bridge_requests WHERE bsp_from_address=? AND timestamp LIKE ? AND status != 'rejected'",
+            (bsp_from, today + '%')
+        ).fetchone()
+        conn_check.close()
+        daily_total = row[0] if row else 0
+        if daily_total + float(amount) > 500:
+            remaining = max(0, 500 - daily_total)
+            return jsonify({'error': f'Daily limit of 500 BSP per wallet reached. You have {remaining:.0f} BSP remaining today.'}), 400
+    conn = _sqlite3.connect(BRIDGE_DB)
+    c = conn.cursor()
+    c.execute("INSERT INTO bridge_requests (polygon_address, bsp_amount, bsp_from_address, timestamp, status) VALUES (?,?,?,?,?)",
+              (poly, float(amount), bsp_from, datetime.utcnow().isoformat(), 'pending'))
+    req_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    bridge_address = os.environ.get('BRIDGE_ADDRESS', '1BEdzEJXqAcfWpZDK3ePJiCAcjUL4rnMVw')
+    r = jsonify({'request_id': req_id, 'bridge_address': bridge_address, 'status': 'pending'})
+    r.headers['Access-Control-Allow-Origin'] = '*'
+    return r
+
+@app.route('/bridge/status/<int:req_id>', methods=['GET'])
+def bridge_status(req_id):
+    conn = _sqlite3.connect(BRIDGE_DB)
+    row = conn.execute("SELECT id, polygon_address, bsp_amount, status, bsp_txid, polygon_txid FROM bridge_requests WHERE id=?", (req_id,)).fetchone()
+    conn.close()
+    if not row:
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify({'id': row[0], 'polygon_address': row[1], 'bsp_amount': row[2], 'status': row[3], 'bsp_txid': row[4], 'polygon_txid': row[5]})
+
+
+# ── SitRep / AI Daily Summary ─────────────────────────────────────────────────
+import time as _time_module
+
+_sitrep_cache = {'data': None, 'ts': 0}
+SITREP_TTL = 3600  # regenerate every hour
+OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY')
+
+@app.route('/sitrep', methods=['GET'])
+def sitrep():
+    global _sitrep_cache
+    now = _time_module.time()
+
+    # Return cached if fresh
+    if _sitrep_cache['data'] and (now - _sitrep_cache['ts']) < SITREP_TTL:
+        r = jsonify(_sitrep_cache['data'])
+        r.headers['Access-Control-Allow-Origin'] = '*'
+        return r
+
+    try:
+        import requests as _req
+
+        # Gather live stats
+        height = blockchain.db.get_block_count() or len(blockchain.chain)
+        reward = blockchain.get_current_mining_reward()
+        supply = blockchain.get_circulating_supply()
+        pending = len(blockchain.pending_transactions)
+        max_supply = blockchain.max_supply
+
+        # Recent mining activity — blocks in last hour
+        try:
+            cursor = blockchain.db.conn.cursor()
+            one_hour_ago = _time_module.time() - 3600
+            cursor.execute("SELECT COUNT(*) FROM blocks WHERE timestamp > ?", (one_hour_ago,))
+            blocks_last_hour = cursor.fetchone()[0]
+        except:
+            blocks_last_hour = 0
+
+        prompt = f"""You are the Bespin Coin (BSP) daily analyst. Write a concise 3-sentence "SitRep" (Situation Report) for the Bespin community based on these live stats:
+
+- Block height: {height:,}
+- Circulating supply: {supply:,.0f} BSP ({(supply/max_supply*100):.1f}% of max supply)
+- Current block reward: {reward} BSP
+- Pending transactions: {pending}
+- Blocks mined in last hour: {blocks_last_hour}
+- BSP price: $0.01 USD
+- wBSP bridge: live on Polygon, 500 BSP/day limit
+- QuickSwap liquidity pool: launching 25th March 2026
+
+Also give a "vibe score" from 0-100 representing overall network health and momentum.
+
+Format your response as JSON exactly like this:
+{{"score": 72, "summary": "Your 3-sentence summary here."}}
+
+Keep it punchy, informative, and community-friendly. No markdown, just the JSON."""
+
+        resp = _req.post(
+            'https://api.openai.com/v1/chat/completions',
+            headers={'Authorization': f'Bearer {OPENAI_API_KEY}', 'Content-Type': 'application/json'},
+            json={
+                'model': 'gpt-4o-mini',
+                'messages': [{'role': 'user', 'content': prompt}],
+                'max_tokens': 200,
+                'temperature': 0.7
+            },
+            timeout=15
+        )
+        content = resp.json()['choices'][0]['message']['content'].strip()
+        # Parse JSON from response
+        import json as _json
+        result = _json.loads(content)
+        result['generated_at'] = datetime.utcnow().isoformat()
+        result['block_height'] = height
+        result['cached'] = False
+
+        _sitrep_cache = {'data': result, 'ts': now}
+
+    except Exception as e:
+        # Fallback if OpenAI fails
+        result = {
+            'score': 70,
+            'summary': f'Bespin network is running smoothly at block {height:,}. Mining continues at {reward} BSP per block with {supply:,.0f} BSP in circulation. The wBSP bridge is live on Polygon with QuickSwap liquidity launching 25th March 2026.',
+            'generated_at': datetime.utcnow().isoformat(),
+            'block_height': height,
+            'cached': False,
+            'fallback': True
+        }
+        _sitrep_cache = {'data': result, 'ts': now}
+
+    r = jsonify(result)
+    r.headers['Access-Control-Allow-Origin'] = '*'
+    return r
 
 if __name__ == '__main__':
     import sys

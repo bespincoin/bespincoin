@@ -1,224 +1,135 @@
-# Bespin (BSP) - Secure Cryptocurrency
+# Bespin (BSP) - Peer-to-Peer Cryptocurrency
 
-A production-grade, Bitcoin-inspired blockchain with P2P networking and REST API, ready for DigitalOcean deployment.
+A Bitcoin-inspired blockchain with UTXO model, P2P networking, proof-of-work mining, and REST API.
 
-**Bespin** - Currency in the clouds. A decentralized cryptocurrency built with enterprise-grade security.
+- Website: [bespincoin.com](https://bespincoin.com)
+- Explorer: [bespincoin.com/explorer](https://bespincoin.com/explorer)
+- Wallet: [wallet.bespincoin.com](https://wallet.bespincoin.com)
+- Live API: [api.bespincoin.com](https://api.bespincoin.com)
 
-## Features
+## Running a Full Node
 
-### Core Security
-- ECDSA digital signatures (secp256k1)
-- UTXO model for double-spend prevention
-- Merkle trees for transaction verification
-- Proof-of-work consensus
-- Bitcoin-style addresses with checksums
+### Requirements
+- Python 3.10+
+- 2GB RAM minimum (4GB recommended — UTXO set loads into memory)
+- Ubuntu 22.04 recommended
 
-### Network
-- P2P peer-to-peer networking
-- Automatic peer discovery
-- Block and transaction broadcasting
-- Multi-node synchronization
+### Install
 
-### API
-- RESTful API for all operations
-- Wallet management
-- Transaction creation
-- Mining interface
-- Network monitoring
-
-## Quick Start
-
-### Local Testing
 ```bash
-# Install dependencies
+git clone https://github.com/YOUR_REPO/bespincoin.git
+cd bespincoin
 pip install -r requirements.txt
+```
 
-# Start node
-python node.py --p2p-port 5000 --api-port 8000
+### Start the node
 
-# In another terminal, test API
+```bash
+gunicorn --bind 0.0.0.0:8000 --workers 1 --threads 16 --timeout 120 --worker-class gthread wsgi:app
+```
+
+The node takes ~2 minutes to start while it loads the UTXO set. Check it's ready:
+
+```bash
+curl http://localhost:8000/health
+# {"status":"healthy"}
+
 curl http://localhost:8000/info
 ```
 
-### Deploy to DigitalOcean
+### Connect to the live network
+
+The seed node is at `api.bespincoin.com:5000`. Set it via env var and your node will automatically sync the full blockchain on startup — this may take several minutes depending on chain height.
+
 ```bash
-# See deploy/DEPLOYMENT.md for complete guide
-
-# Quick deploy (single node)
-cd deploy
-./deploy.sh YOUR_DROPLET_IP
-
-# Deploy full network (3 nodes)
-./deploy-network.sh
+SEED_NODES=api.bespincoin.com:5000 gunicorn --bind 0.0.0.0:8000 --workers 1 --threads 16 --timeout 120 --worker-class gthread wsgi:app
 ```
+
+Watch the sync progress in the logs — you'll see `Synced to block X/Y` until it catches up.
+
+### Mining
+
+Once your node is running and synced, point your miner at your local API:
+
+```bash
+# Get a wallet address
+curl -X POST http://localhost:8000/wallet/new
+
+# Start mining (replace with your address)
+curl -X POST http://localhost:8000/mine/work \
+  -H "Content-Type: application/json" \
+  -d '{"miner_address": "YOUR_BSP_ADDRESS"}'
+```
+
+Block reward: **25 BSP** | Difficulty: 4 | BSP price: ~$0.01
 
 ## Project Structure
 
 ```
-├── blockchain.py          # Block structure with Merkle trees
-├── chain.py              # Blockchain logic and validation
-├── transaction.py        # UTXO transactions
-├── crypto_utils.py       # ECDSA wallets and signatures
-├── merkle_tree.py        # Merkle tree implementation
-├── utxo_set.py          # UTXO management
-├── network.py           # P2P networking
-├── api.py               # REST API server
-├── node.py              # Node runner
-├── requirements.txt     # Python dependencies
-├── API_EXAMPLES.md      # API usage examples
-└── deploy/              # Deployment scripts
-    ├── DEPLOYMENT.md    # Complete deployment guide
-    ├── setup.sh         # Server setup script
-    ├── deploy.sh        # Deployment script
-    └── terraform/       # Infrastructure as code
+├── blockchain.py      # Block structure, Merkle trees
+├── chain.py           # Blockchain logic and validation
+├── transaction.py     # UTXO transactions
+├── crypto_utils.py    # ECDSA wallets and signatures
+├── merkle_tree.py     # Merkle tree implementation
+├── utxo_set.py        # UTXO set management
+├── persistence.py     # SQLite persistence layer
+├── network.py         # P2P networking
+├── api.py             # REST API (Flask)
+├── node.py            # Node entry point
+├── wsgi.py            # Gunicorn entry point
+└── requirements.txt
 ```
 
-## API Endpoints
+## API Reference
+
+### Node
+- `GET /health` — health check
+- `GET /info` — node info, chain height, supply, peers
 
 ### Blockchain
-- `GET /blockchain` - Get entire chain
-- `GET /block/<index>` - Get specific block
-- `GET /blockchain/validate` - Validate chain
-
-### Transactions
-- `POST /transaction/new` - Create transaction
-- `GET /transactions/pending` - Get pending transactions
-
-### Mining
-- `POST /mine` - Mine new block
+- `GET /blockchain` — recent blocks
+- `GET /block/<index>` — specific block
+- `GET /blockchain/validate` — validate chain integrity
 
 ### Wallet
-- `POST /wallet/new` - Create wallet
-- `GET /wallet/balance/<address>` - Get balance
+- `POST /wallet/new` — create wallet (returns address + private key)
+- `GET /wallet/balance/<address>` — get balance
+- `GET /wallet/utxos/<address>` — get UTXOs
+- `GET /address/<address>` — full address info + transaction history
+
+### Transactions
+- `POST /transaction/new` — send BSP
+- `GET /transactions/pending` — mempool
+
+### Mining
+- `POST /mine/work` — get block template
+- `POST /mine/submit` — submit solved block
 
 ### Network
-- `GET /peers` - Get connected peers
-- `GET /info` - Node information
+- `GET /peers` — connected peers
+- `POST /peers/sync` — trigger sync
 
-See `API_EXAMPLES.md` for detailed examples.
+See `API_EXAMPLES.md` for full request/response examples.
 
-## Deployment
+## Security
 
-### Requirements
-- DigitalOcean account
-- 3 droplets (recommended): $18/month total
-  - 1 GB RAM, 1 vCPU, 25 GB SSD each
-  - Regions: NYC, Frankfurt, Singapore
+- ECDSA signatures (secp256k1) — no unauthorised transactions
+- UTXO model — no double spending
+- Proof-of-work — no chain tampering
+- Merkle trees — no transaction tampering
+- Bitcoin-style addresses with checksums
 
-### Deploy Steps
+## Environment Variables
 
-1. **Create droplets** (via web UI or CLI)
-2. **Deploy seed node**:
-   ```bash
-   cd deploy
-   ./deploy.sh SEED_IP
-   ```
-3. **Deploy additional nodes**:
-   ```bash
-   ./deploy.sh NODE2_IP SEED_IP:5000
-   ./deploy.sh NODE3_IP SEED_IP:5000
-   ```
-
-See `deploy/DEPLOYMENT.md` for complete instructions.
-
-## Security Features
-
-✓ No unauthorized transactions (ECDSA signatures)  
-✓ No double-spending (UTXO validation)  
-✓ No chain tampering (proof-of-work + cryptographic linking)  
-✓ No transaction tampering (Merkle tree verification)  
-✓ No address spoofing (cryptographic address generation)  
-
-## Architecture
-
-```
-┌─────────────────────────────────────────┐
-│           Blockchain Node                │
-├─────────────────────────────────────────┤
-│  REST API (Port 8000)                   │
-│  ├─ Wallet operations                   │
-│  ├─ Transaction submission              │
-│  ├─ Mining interface                    │
-│  └─ Blockchain queries                  │
-├─────────────────────────────────────────┤
-│  P2P Network (Port 5000)                │
-│  ├─ Peer discovery                      │
-│  ├─ Block propagation                   │
-│  ├─ Transaction broadcast               │
-│  └─ Chain synchronization               │
-├─────────────────────────────────────────┤
-│  Blockchain Core                        │
-│  ├─ UTXO set management                 │
-│  ├─ Transaction validation              │
-│  ├─ Block mining (PoW)                  │
-│  └─ Chain validation                    │
-└─────────────────────────────────────────┘
-```
-
-## Usage Examples
-
-### Create wallet and mine
-```bash
-# Create wallet
-curl -X POST http://localhost:8000/wallet/new
-
-# Mine block (use address from above)
-curl -X POST http://localhost:8000/mine \
-  -H "Content-Type: application/json" \
-  -d '{"miner_address": "YOUR_ADDRESS"}'
-
-# Check balance
-curl http://localhost:8000/wallet/balance/YOUR_ADDRESS
-```
-
-### Send transaction
-```bash
-curl -X POST http://localhost:8000/transaction/new \
-  -H "Content-Type: application/json" \
-  -d '{
-    "sender_private_key": "YOUR_PRIVATE_KEY",
-    "recipient_address": "RECIPIENT_ADDRESS",
-    "amount": 10.0
-  }'
-```
-
-## Monitoring
-
-```bash
-# View logs
-ssh root@YOUR_IP 'journalctl -u blockchain-node -f'
-
-# Check peers
-curl http://YOUR_IP:8000/peers
-
-# Validate chain
-curl http://YOUR_IP:8000/blockchain/validate
-```
-
-## Cost
-
-- **Development**: Free (run locally)
-- **Production**: $18/month (3 DigitalOcean droplets)
-- **Enterprise**: Scale as needed
-
-## Documentation
-
-- `API_EXAMPLES.md` - Complete API reference with examples
-- `deploy/DEPLOYMENT.md` - Full deployment guide
-- `deploy/digitalocean-setup.md` - Step-by-step DigitalOcean setup
-
-## Next Steps
-
-1. Deploy to DigitalOcean
-2. Setup domain names
-3. Add Cloudflare for DDoS protection
-4. Create blockchain explorer UI
-5. Build wallet application
+| Variable | Default | Description |
+|---|---|---|
+| `SEED_NODES` | None | Comma-separated seed nodes e.g. `api.bespincoin.com:5000` |
+| `FOUNDER_ADDRESS` | None | BSP address for genesis allocation (not needed for regular nodes) |
+| `NODE_PORT` | 5000 | P2P port |
+| `API_PORT` | 8000 | API port |
+| `OPENAI_API_KEY` | None | Optional — only needed for the `/sitrep` endpoint |
+| `BRIDGE_ADDRESS` | *(public bridge address)* | BSP→wBSP bridge deposit address |
 
 ## License
 
-MIT License - Use for any purpose
-
-## Support
-
-For issues or questions, check the documentation or create an issue.
+MIT
