@@ -56,11 +56,12 @@ class Transaction:
     """Bitcoin-style transaction with inputs and outputs"""
     
     def __init__(self, inputs: List[TxInput], outputs: List[TxOutput], 
-                 locktime: int = 0):
+                 locktime: int = 0, memo: str = ''):
         self.version = 1
         self.inputs = inputs
         self.outputs = outputs
         self.locktime = locktime
+        self.memo = memo or ''
         self.timestamp = time.time()
         self.txid = self.calculate_txid()
     
@@ -72,6 +73,8 @@ class Transaction:
             'locktime': self.locktime,
             'timestamp': self.timestamp
         }
+        if self.memo:
+            data['memo'] = self.memo
         if include_txid:
             data['txid'] = self.txid
         return data

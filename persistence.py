@@ -59,6 +59,7 @@ class BlockchainDB:
                 version INTEGER NOT NULL,
                 locktime INTEGER NOT NULL,
                 timestamp REAL NOT NULL,
+                memo TEXT DEFAULT '',
                 FOREIGN KEY (block_index) REFERENCES blocks(block_index)
             )
         """)
@@ -153,9 +154,9 @@ class BlockchainDB:
         # Save transaction
         cursor.execute("""
             INSERT OR IGNORE INTO transactions 
-            (txid, block_index, version, locktime, timestamp)
-            VALUES (?, ?, ?, ?, ?)
-        """, (tx.txid, block_index, tx.version, tx.locktime, tx.timestamp))
+            (txid, block_index, version, locktime, timestamp, memo)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (tx.txid, block_index, tx.version, tx.locktime, tx.timestamp, getattr(tx, 'memo', '')))
         
         # Only write inputs/outputs if transaction was actually inserted
         if cursor.rowcount == 0:

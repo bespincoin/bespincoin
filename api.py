@@ -107,6 +107,7 @@ def new_transaction():
         sender_wallet = Wallet.from_private_key(data['sender_private_key'])
         amount = float(data['amount'])
         recipient_address = data['recipient_address']
+        memo = str(data.get('memo', ''))[:64]  # cap at 64 chars
 
         all_utxos = blockchain.utxo_set.get_utxos_for_address(sender_wallet.address)
         total_balance = sum(u.amount for u in all_utxos)
@@ -121,7 +122,7 @@ def new_transaction():
             change = round(total_in - send_amount, 8)
             if change > 0.00000001:
                 outputs.append(TxOutput(amount=change, script_pubkey=sender_wallet.address))
-            tx = Transaction(inputs, outputs)
+            tx = Transaction(inputs, outputs, memo=memo)
             for i, tx_input in enumerate(tx.inputs):
                 sig = sender_wallet.sign(tx.get_signing_data(i))
                 tx_input.script_sig = sig.hex() + ":" + sender_wallet.get_public_key_hex()
@@ -393,7 +394,7 @@ def get_address_info(address):
         
         # Query transactions where address received coins
         cursor.execute("""
-            SELECT b.block_index, t.txid, t.timestamp, o.amount, o.vout
+            SELECT b.block_index, t.txid, t.timestamp, o.amount, o.vout, t.memo
             FROM transactions t
             JOIN blocks b ON t.block_index = b.block_index
             JOIN tx_outputs o ON t.txid = o.txid
@@ -428,7 +429,8 @@ def get_address_info(address):
                 'type': 'received',
                 'amount': row[3],
                 'vout': row[4],
-                'from': from_address or 'Coinbase'
+                'from': from_address or 'Coinbase',
+                'memo': row[5] or ''
             })
     except Exception as e:
         print(f"Error fetching transactions for {address}: {e}")
