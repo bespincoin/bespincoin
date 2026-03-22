@@ -29,6 +29,7 @@ class Blockchain:
         self.target_block_time = 600        # 10 minutes in seconds
         self.retarget_interval = 2016       # retarget every 2016 blocks (~2 weeks)
         self.max_difficulty_change = 4      # max 4x adjustment per period
+        self.max_difficulty = 6             # hard cap — Python miners can't handle >6 leading zeros
         
         if self.load_from_db():
             self.founder_address = self.db.get_metadata('founder_address')
@@ -323,7 +324,7 @@ class Blockchain:
         ratio = max(1 / self.max_difficulty_change, min(self.max_difficulty_change, ratio))
 
         # Difficulty is the number of leading zero bits — adjust proportionally
-        new_difficulty = max(1, round(self.difficulty / ratio))
+        new_difficulty = max(1, min(self.max_difficulty, round(self.difficulty / ratio)))
 
         print(f"Difficulty retarget at block {actual_height}: "
               f"actual={actual_time:.0f}s expected={expected_time:.0f}s "
