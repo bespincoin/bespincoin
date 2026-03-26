@@ -280,6 +280,12 @@ class Blockchain:
             if block.previous_hash != latest_db_block.hash:
                 print(f"Invalid previous hash - chain moved on, block rejected")
                 return False
+            # Enforce minimum 10 minute block time
+            min_block_time = 600  # 10 minutes
+            time_since_last = block.timestamp - latest_db_block.timestamp
+            if time_since_last < min_block_time:
+                print(f"Block rejected: too soon ({time_since_last:.0f}s since last block, minimum {min_block_time}s)")
+                return False
             if not block.verify_merkle_root():
                 print("Invalid Merkle root")
                 return False
