@@ -295,9 +295,9 @@ def main():
 
     init_db()
 
-    private_key = os.environ.get('BRIDGE_PRIVATE_KEY', '6118c3db407200a298a19305a3ed1af4172a1d04442bf3787fc53c31471a5f92')
+    private_key = os.environ.get('BRIDGE_PRIVATE_KEY')
     if not private_key:
-        print("ERROR: Private key required!")
+        print("ERROR: BRIDGE_PRIVATE_KEY environment variable not set!")
         return
 
     # Verify key works
