@@ -109,7 +109,16 @@ def new_transaction():
         recipient_address = data['recipient_address']
         memo = str(data.get('memo', ''))[:64]  # cap at 64 chars
 
-        all_utxos = blockchain.utxo_set.get_utxos_for_address(sender_wallet.address)
+        # Exclude UTXOs already spent by pending mempool transactions
+        mempool_spent = {
+            (inp.txid, inp.vout)
+            for tx in blockchain.pending_transactions
+            for inp in tx.inputs
+        }
+        all_utxos = [
+            u for u in blockchain.utxo_set.get_utxos_for_address(sender_wallet.address)
+            if (u.txid, u.vout) not in mempool_spent
+        ]
         total_balance = sum(u.amount for u in all_utxos)
 
         if total_balance < amount:
@@ -173,6 +182,12 @@ def new_transaction():
                 # Final send — re-fetch UTXOs to get consolidated ones
                 _time.sleep(1.0)
                 fresh_utxos = blockchain.utxo_set.get_utxos_for_address(wallet.address)
+                fresh_mempool_spent = {
+                    (inp.txid, inp.vout)
+                    for tx in blockchain.pending_transactions
+                    for inp in tx.inputs
+                }
+                fresh_utxos = [u for u in fresh_utxos if (u.txid, u.vout) not in fresh_mempool_spent]
                 fresh_selected = []
                 fresh_running = 0.0
                 for u in fresh_utxos:
@@ -853,12 +868,18 @@ def bridge_request():
     bsp_from = data.get('bsp_from_address', '').strip()
     if not poly or not amount:
         return jsonify({'error': 'Missing required fields'}), 400
+
+    # Admin key bypasses all limits
+    admin_key = data.get('admin_key', '')
+    bridge_admin_key = os.environ.get('BRIDGE_ADMIN_KEY', '')
+    is_admin = bridge_admin_key and admin_key == bridge_admin_key
+
     if float(amount) < 1:
         return jsonify({'error': 'Minimum bridge amount is 1 BSP'}), 400
-    if float(amount) > 500:
+    if not is_admin and float(amount) > 500:
         return jsonify({'error': 'Maximum bridge amount is 500 BSP per request'}), 400
     # Check daily limit per BSP address (500 BSP per wallet per day)
-    if bsp_from:
+    if not is_admin and bsp_from:
         from datetime import datetime as _dt
         today = _dt.utcnow().strftime('%Y-%m-%d')
         conn_check = _sqlite3.connect(BRIDGE_DB)
